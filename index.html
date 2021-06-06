@@ -1,0 +1,749 @@
+<script>"use strict";
+</script>
+<!DOCTYPE html><html><head>
+<title>transformerTFJS</title>
+<meta charset="UTF-8">
+<!-- to do:
+- pre LN transformer (https://arxiv.org/abs/2002.04745)
+- dense convolitions (https://arxiv.org/abs/2001.02394)
+- linear attention
+- beam search
+- weight penalty
+- transition layer as separable conv (universal transformer)
+-->
+
+<!-- **************************************************************************
+ * stylesheet
+-->
+<style>
+html {
+	text-size-adjust: 100%;
+	font-family: sans-serif;
+}
+</style>
+
+<!-- **************************************************************************
+ * import tensorflowJS
+ 
+-->
+<script src='tf.min@3.7.js'> </script>
+<script src='tfjs-backend-webgpu.browser.js'> </script>
+
+<!--
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs/dist/tf.min.js"> </script>
+<script src='tf.min.js'> </script>
+<script src='tfjs-backend-webgpu.browser.js'> </script>
+
+-->
+
+<!-- **************************************************************************
+ * import gpt-3 tokenizer (browserified from https://github.com/kafkas/GPT-3-Encoder)
+-->
+<script src='gpt3encoder.js'> </script>
+
+<!-- **************************************************************************
+ * DATASET "crime & punishment" book by dostojewsky as javascript import -> var DATASET = book
+-->
+<script src="crime-and-punishment_small.txt.js"></script>
+
+<script>
+/******************************************************************************
+ * https://stackoverflow.com/a/39914235 to unblock ui
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+</script> 
+
+<script>
+/******************************************************************************
+ * print log
+ */
+async function log(message) {
+	document.getElementById('log').innerHTML += message + '\n';
+	document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+	await sleep(1);
+}
+</script> 
+
+<script>
+/******************************************************************************
+ * supplementary functions
+ */
+function getRandomInt(max){ //get random integer including 0
+	return Math.floor(Math.random() * Math.floor(max));
+}
+</script>
+
+<script>
+/******************************************************************************
+ * initialize vars 
+ */
+async function initialize(){
+	dModel = 64; //dimension of embedding
+	FEEDFORWARD_DIMENSION = 1024; //dimension of feed forward blocks
+	EPOCHS = 1e9; //how many epochs to train
+	INPUTSIZE = 512; //length of input
+	STEPS = 1; //steps per epoch
+	BLOCKS = 12;
+	BATCH_SIZE = 3; 
+	PREDICTION_EPOCHS = 100;
+	LEARNING_RATE = 0.0001;
+	OPTIMIZER = tf.train.adamax(LEARNING_RATE, beta_1 = 0.6, beta_2 = 0.9, epsilon = 1e-7, decay = 0.01);
+	//OPTIMIZER = tf.train.adam(LEARNING_RATE, beta_1 = 0.6, beta_2 = 0.9, epsilon = 1e-7);
+	//OPTIMIZER = tf.train.adam(LEARNING_RATE);
+	MODEL_SAVE_NAME = 'gpt2_separable' + dModel;
+
+	LOSS = 'categoricalCrossentropy';
+
+	INITIALIZER = 'GlorotUniform';
+	BEAMLENGTH = 16; //how log the Beam Search schould be
+	MAXTOPKS = 4; //max different token for predicting the beam
+	TEMPERATURE = 0.5; //temperature of softmax
+	MAXPROBABILITY = 0.9; //nucleus / top P as defined in https://arxiv.org/abs/1904.09751
+	TOKENS = [];
+	//remove translators preface from DATASET
+	await log('extracting novel content...');
+	DATASET = DATASET.substring(DATASET.indexOf('PART I'), DATASET.indexOf('End of Project Gutenberg'));
+	// remove all non text characters from text and replace ? and ! with .
+	await log('converting to lower case...');
+	DATASET = DATASET.toLowerCase();
+	await log('stripping all special characters...');
+	DATASET = DATASET.replace(/$/g, '');
+	DATASET = DATASET.replace(/_/g, '');
+	DATASET = DATASET.replace(/\.\.\./g, '');
+	DATASET = DATASET.replace(/"/g, '');
+	DATASET = DATASET.replace(/“/g, '');
+	DATASET = DATASET.replace(/”/g, '');
+	DATASET = DATASET.replace(/'/g, '');
+	DATASET = DATASET.replace(/`/g, '');
+	DATASET = DATASET.replace(/1/g, '');
+	DATASET = DATASET.replace(/2/g, '');
+	DATASET = DATASET.replace(/3/g, '');
+	DATASET = DATASET.replace(/4/g, '');
+	DATASET = DATASET.replace(/5/g, '');
+	DATASET = DATASET.replace(/6/g, '');
+	DATASET = DATASET.replace(/7/g, '');
+	DATASET = DATASET.replace(/8/g, '');
+	DATASET = DATASET.replace(/9/g, '');
+	DATASET = DATASET.replace(/0/g, '');
+	DATASET = DATASET.replace(/´/g, '');
+	DATASET = DATASET.replace(/’/g, '');
+	DATASET = DATASET.replace(/‘/g, '');
+	DATASET = DATASET.replace(/\(/g, '');
+	DATASET = DATASET.replace(/\)/g, '');
+	DATASET = DATASET.replace(/--/g, ', ');
+	DATASET = DATASET.replace(/;/g, ',');
+	DATASET = DATASET.replace(/:/g, '.');
+	DATASET = DATASET.replace(/\?/g, ',');
+	DATASET = DATASET.replace(/!/g, ',');
+	DATASET = DATASET.replace(/\./g, ' .');
+	DATASET = DATASET.replace(/\,/g, ' ,');
+	await log('removing line breaks...');
+	DATASET = DATASET.replace(/\s+/gm, ' ');
+/*	TOKENS = DATASET.valueOf();
+	await log('building BPE dictionary and tokenizing dataset...');
+	DICTIONARY = [];
+	while (!new RegExp("^[\s" + SPECIAL_CHAR + "]$").test(DATASET)){
+		let bigram = await findFrequentBigram(DATASET);
+		DICTIONARY.push(bigram);
+		DATASET = DATASET.replaceAll(bigram, SPECIAL_CHAR);
+		TOKENS = TOKENS.replaceAll(bigram, SPECIAL_CHAR + (DICTIONARY.length - 1).toString());
+	}
+	TOKENS = TOKENS.split(SPECIAL_CHAR);
+	VOCABULARY_SIZE = DICTIONARY.length;
+*/	
+	TOKENS = gpt3_encode(DATASET);
+//await sleep(101100000000);	
+	TOKENS = Object.values(TOKENS) //convert from object to flat array
+//	for (let i = 0; i < TOKENS.length)
+//	TOKENS = gpt3_decode([...TOKENS]);
+	DICTIONARY = new Set(TOKENS);
+	DICTIONARY = [...DICTIONARY]; //convert to array
+//	for(let i = 0; i < DICTIONARY.length; i++){
+//		DICTIONARY[i] = gpt3_decode([DICTIONARY[i]])
+//	}
+	VOCABULARY_SIZE = DICTIONARY.length;
+	await log('imported ' + TOKENS.length + ' tokens of ' + DICTIONARY.length + ' classes...');
+//await sleep(100000000);	
+}
+</script>
+
+<script>
+/******************************************************************************
+ * softmax js implementation
+ * https://gist.github.com/cyphunk/6c255fa05dd30e69f438a930faeb53fe 
+ */
+function softmax(logits) {
+    const maxLogit = Math.max(...logits);
+    const scores = logits.map(l => Math.exp(l - maxLogit));
+    const denom = scores.reduce((a, b) => a + b);
+    return scores.map(s => s / denom);
+}
+</script>
+
+<script>
+/******************************************************************************
+ * Popular metric for evaluating language modelling architectures.
+ * More info:
+ * - http://cs224d.stanford.edu/lecture_notes/LectureNotes4.pdf
+ * - https://github.com/keras-team/keras/issues/8267
+ */
+function perplexity(yTrue, yPred) {
+	return tf.tidy(() => {
+		return(
+			tf.mean(
+				tf.exp(
+					tf.mean(
+						tf.metrics.categoricalCrossentropy(yTrue, yPred)
+					)
+				)
+			)
+		)
+	});
+}
+
+</script>
+
+<script>
+/******************************************************************************
+ * tensorflow.js lambda layer
+ * written by twitter.com/benjaminwegener
+ * license: MIT
+ */
+class lambdaLayer extends tf.layers.Layer {
+    constructor(config) {
+        super(config);
+        if (config.name === undefined) {
+            config.name = ((+new Date) * Math.random()).toString(36); //random name from timestamp in case name hasn't been set
+        }
+        this.name = config.name;
+        this.lambdaFunction = config.lambdaFunction;
+        this.lambdaOutputShape = config.lambdaOutputShape;
+    }
+    call(input) {
+        return tf.tidy(() => {
+            let result = null;
+            eval(this.lambdaFunction);
+            return result;
+        });
+    }
+    computeOutputShape(inputShape) {
+        if (this.lambdaOutputShape === undefined) { //if no outputshape provided, try to set as inputshape
+            return inputShape[0];
+        } else {
+            return this.lambdaOutputShape;
+        }
+    }
+    getConfig() {
+        const config = super.getConfig();
+        Object.assign(config, {
+            lambdaFunction: this.lambdaFunction,
+   lambdaOutputShape: this.lambdaOutputShape
+        });
+        return config;
+    }
+    static get className() {
+        return 'lambdaLayer';
+    }
+}
+tf.serialization.registerClass(lambdaLayer);
+</script>
+
+<script>
+/******************************************************************************
+ * create new attention model
+ */
+async function loadAttentionModel(){
+	await log('building new attention model...');
+	let queries = tf.input({name: 'queries', shape: [INPUTSIZE, dModel]}); // 0, 1024, 64
+	let keys = tf.input({name: 'keys', shape: [INPUTSIZE, dModel]}); // 0, 1024, 64
+	let values = tf.input({name: 'values', shape: [INPUTSIZE, dModel]}); // 0, 1024, 64
+	let keysTransposed = tf.layers.permute({dims: [2, 1]}).apply(keys); // 0, 64, 1024
+	let valuesTransposed = tf.layers.permute({dims: [2, 1]}).apply(values); // 0, 64, 1024
+	let proj = tf.input({shape: [dModel, INPUTSIZE]}); // 0, 64, 1024
+	let projOutput = tf.layers.dense({units: dModel, kernelInitializer: 'glorotNormal', biasInitializer: 'glorotNormal'}).apply(proj); // 0, 64, 64
+	let projModel = tf.model({inputs: proj, outputs: projOutput});
+	let eProj = projModel.apply(keysTransposed); // 0, 64, 64
+	let fProj = projModel.apply(valuesTransposed); // 0, 64, 64
+	
+	let attention1 = new lambdaLayer({name: 'attention1', lambdaFunction: `
+		let qk = tf.matMul(input[0], input[1]); // 0, 1024, 64
+		let pBar = tf.div(qk, tf.sqrt(tf.scalar(input[0].shape[2]))); // 0, 1024, 64
+		let causalMask = tf.transpose(tf.linalg.bandPart(tf.ones([input[0].shape[2], input[0].shape[1]]), 0, -1)); // 1024, 64
+		let infinityMask = tf.sub(causalMask, tf.scalar(1)); // 1024, 64
+		infinityMask = tf.mul(infinityMask, tf.scalar(1e16)); //this should be preprocessed // 1024, 64
+		
+		pBar = tf.mul(pBar, causalMask); // 0, 1024, 64
+		pBar = tf.add(pBar, infinityMask); // 0, 1024, 64
+		pBar = tf.softmax(pBar, 2); // 0, 1024, 64
+		result = tf.matMul(pBar, input[2], false, true);
+	`, lambdaOutputShape: [queries.shape]}).apply([queries, eProj, fProj]); // 0, 1024, 64
+	attention1 = tf.layers.dropout({rate: 0.1}).apply(attention1); // 0, 1024, 64
+	let attention2 = new lambdaLayer({name: 'attention2', lambdaFunction: `
+		result = tf.matMul(input[0], input[1], false, true);
+	`, lambdaOutputShape: [values.shape]}).apply([attention1, fProj]); // 0, 1024, 64
+	
+	attention_model = tf.model({inputs: [queries, keys, values], outputs: attention2});
+	attention_model.compile({optimizer: OPTIMIZER, loss: LOSS});
+	attention_model.summary();
+
+
+}
+</script>
+
+<script>
+/******************************************************************************
+ * load model or create new
+ */
+async function loadModel(){
+	try {
+		
+		//model = await tf.loadLayersModel(MODEL_SAVE_NAME + '.json');
+		model = await tf.loadLayersModel('indexeddb://' + MODEL_SAVE_NAME);
+		model.compile({optimizer: OPTIMIZER, loss: LOSS, metrics: perplexity});
+		await log('successfully loaded saved model...');
+	}catch(err){
+		await log(err+' - building new model...');
+		let x;
+		let inputs = tf.input({name: 'input', shape: [null]});
+		
+		//embedding
+		x = tf.layers.embedding({name: 'embedding', inputDim: VOCABULARY_SIZE + 1, outputDim: dModel}).apply(inputs);
+		pos = new lambdaLayer({name: 'pos', lambdaFunction: `
+			result = tf.range(0, input[0].shape[1]);
+			result = tf.expandDims(result, 0);
+		`, lambdaOutputShape: inputs.shape}).apply(inputs);
+		pos = tf.layers.embedding({name: 'pos_embedding', inputDim: INPUTSIZE, outputDim: dModel}).apply(pos);
+		x = tf.layers.add({name: 'pos_add'}).apply([x, pos]);
+/*
+		//reduce embedding by sqrt
+		x = new lambdaLayer({name: 'squareReduction_0', lambdaFunction: `
+			result = tf.mul(
+				input[0], 
+				tf.sqrt(tf.scalar(input[0].shape[2]))
+			);
+		`, lambdaOutputShape: x.shape}).apply(x);
+*/
+		
+		//positional encoding
+
+/*		let pos = new lambdaLayer({name: 'positionEncoding1', lambdaFunction: `
+			let positionMatrix = new Array(input[0].shape[2]);
+			for (let p = 0; p < input[0].shape[2]; p += 2) {
+				let divTerm = Math.exp(p * (0 - Math.log(2 * input[0].shape[1]) / input[0].shape[2]));
+				positionMatrix[p] = Math.sin(divTerm);
+				positionMatrix[p + 1] = Math.cos(divTerm);
+			}
+			result = tf.add(
+				input[0], 
+				tf.tensor(positionMatrix)
+			);
+		`, lambdaOutputShape: inputs.shape}).apply(inputs);
+*/
+/*		x = new lambdaLayer({name: 'positionEncoding1', lambdaFunction: `
+			let positionMatrix = new Array(input[0].shape[2]);
+			for (let p = 0; p < input[0].shape[2]; p += 2) {
+				let divTerm = Math.exp(p * (0 - Math.log(2 * input[0].shape[1]) / input[0].shape[2]));
+				positionMatrix[p] = Math.sin(divTerm);
+				positionMatrix[p + 1] = Math.cos(divTerm);
+			}
+			result = tf.add(
+				input[0], 
+				tf.tensor(positionMatrix)
+			);
+		`, lambdaOutputShape: x.shape}).apply(x);
+*/
+/*
+		let pos = new lambdaLayer({name: 'positionEncoding1', lambdaFunction: `
+			let positionTensor = new Array(input[0].shape[2]).fill(0);
+			for (let p = 0; p < input[0].shape[2]; p++) {
+				positionTensor[p] = p;
+			}
+			result = tf.tensor(positionTensor);
+		`, lambdaOutputShape: inputs.shape}).apply(inputs);
+*/
+//		pos = tf.layers.embedding({name: 'embedding_pos', inputDim: VOCABULARY_SIZE + 1, outputDim: dModel}).apply(pos);
+//		x = tf.layers.embedding({name: 'embedding_pos', inputDim: VOCABULARY_SIZE + 1, outputDim: dModel}).apply(x);
+		//reduce by sqrt
+/*		pos = new lambdaLayer({name: 'squareReduction_0', lambdaFunction: `
+			result = tf.mul(
+				input[0], 
+				tf.sqrt(tf.scalar(input[0].shape[2]))
+			);
+		`, lambdaOutputShape: pos.shape}).apply(pos);
+*/
+//		x = tf.layers.add().apply([x, pos]);
+
+		// transformer decoder blocks
+		let skipConnection; let queries; let keys; let values;
+		for (i = 1; i < BLOCKS + 1; i++){
+			skipConnection = x;
+
+			x = tf.layers.layerNormalization({name: 'normalization_' + i}).apply(x);
+			queries = tf.layers.dense({name: 'queries_' + i, units: dModel}).apply(x);
+			keys = tf.layers.dense({name: 'keys_' + i, units: dModel}).apply(x);
+			values = tf.layers.dense({name: 'values_' + i, units: dModel}).apply(x);
+
+			x = attention_model.apply([queries, keys, values]);
+
+			x = tf.layers.dropout({name: 'dropOut_' + i, rate: 0.1}).apply(x);
+			x = tf.layers.add({name: 'skipConnection_' + i}).apply([x, skipConnection]);
+			skipConnection = x;
+		
+			//feed forward network
+			x = tf.layers.layerNormalization({name: 'normalization_' + i + '_2'}).apply(x);
+			x = tf.layers.reshape({targetShape: [INPUTSIZE, dModel, 1]}).apply(x);
+			x = tf.layers.separableConv2d({filters: 1, kernelSize: [INPUTSIZE, 3], padding: 'same'}).apply(x)
+			//x = tf.layers.dense({units: FEEDFORWARD_DIMENSION}).apply(x);
+			x = new lambdaLayer({name: 'gelu_' + i, lambdaFunction: `
+				result = tf.mul(
+					tf.scalar(0.5),
+					tf.mul(
+						input[0],
+						tf.add(
+							tf.scalar(1),
+							tf.tanh(
+								tf.mul(
+									tf.scalar(0.797884560), // c = math.sqrt(2 / math.pi)
+									tf.add(
+										input[0],
+										tf.mul(
+											tf.scalar(0.044715),
+											tf.pow(
+												input[0],
+												tf.scalar(3)
+											)
+										)
+									)
+								)				
+							)
+						)
+					)
+				)
+			`, lambdaOutputShape: x.shape}).apply(x);
+			x = tf.layers.dropout({name: 'dropOut_' + i + '_2', rate: 0.1}).apply(x);
+			x = tf.layers.separableConv2d({filters: 1, kernelSize: [INPUTSIZE, 3], padding: 'same'}).apply(x)
+			x = tf.layers.reshape({targetShape: [INPUTSIZE, dModel]}).apply(x);
+			//x = tf.layers.dense({units: dModel}).apply(x);
+			//x = tf.layers.dropout({name: 'dropOut_' + i + '_2', rate: 0.1}).apply(x);
+			x = tf.layers.add({name: 'skipConnection_' + i + '_2'}).apply([x, skipConnection]);
+			//reduce by sqrt
+			x = new lambdaLayer({name: 'squareReduction_' + i, lambdaFunction: `
+				result = tf.mul(
+					input[0], 
+					tf.sqrt(tf.scalar(input[0].shape[2]))
+				);
+			`, lambdaOutputShape: x.shape}).apply(x);
+
+		}
+		
+		//last section ------------------------------------------------
+		let outputs = x
+		outputs = tf.layers.layerNormalization({name: 'normalization_outputs'}).apply(outputs);
+		outputs = tf.layers.dense({name: 'dense_outputs1', units: FEEDFORWARD_DIMENSION}).apply(outputs);
+		outputs = new lambdaLayer({name: 'gelu_outputs', lambdaFunction: `
+			result = tf.mul(
+				tf.scalar(0.5),
+				tf.mul(
+					input[0],
+					tf.add(
+						tf.scalar(1),
+						tf.tanh(
+							tf.mul(
+								tf.scalar(0.797884560), // c = math.sqrt(2 / math.pi)
+								tf.add(
+									input[0],
+									tf.mul(
+										tf.scalar(0.044715),
+										tf.pow(
+											input[0],
+											tf.scalar(3)
+										)
+									)
+								)
+							)				
+						)
+					)
+				)
+			)
+		`, lambdaOutputShape: outputs.shape}).apply(outputs);
+/*		outputs = new lambdaLayer({name: 'temperature_scaling', lambdaFunction: ` //https://arxiv.org/pdf/1706.04599.pdf
+			result = tf.div(
+				input[0],
+				tf.scalar(3),
+			)
+		`, lambdaOutputShape: outputs.shape}).apply(outputs);
+*/
+//		outputs = tf.layers.dense({name: 'dense_outputs1', units: dModel, activation: 'gelu'}).apply(outputs);
+
+		outputs = tf.layers.dense({name: 'dense_outputs2', units: VOCABULARY_SIZE, activation: 'softmax'}).apply(outputs);
+		//outputs = tf.layers.dense({name: 'dense_outputs2', units: VOCABULARY_SIZE}).apply(outputs);
+		outputs = tf.layers.dropout({name: 'dropout_outputs', rate: 0.1}).apply(outputs);
+
+		// Create the model based on the inputs and outputs.
+		model = tf.model({inputs: inputs, outputs: outputs});
+//		await model.save('indexeddb://' + MODEL_SAVE_NAME);
+		model.compile({optimizer: OPTIMIZER, loss: LOSS, metrics: perplexity});
+//const saveResult = await model.save('downloads://mymodel');
+
+	}
+	model.summary();
+}
+</script>
+
+<script>
+/******************************************************************************
+ * encode and decode supplemental functions
+ */
+function encode(input){
+	return output;
+}
+
+function decode(input){
+	return output;
+}
+</script>
+
+<script>
+/******************************************************************************
+ * train function
+ */
+async function train(epoch){
+	let start = performance.now();
+	let modelInputTensor;
+	let predictionInputTensor;
+	let expectedOutputTensor;
+	let groundtruth;
+	let result;
+	let modelInputBatch = [];
+	let targetOutputBatch = [];
+	for (let b = 0; b < BATCH_SIZE; b++){
+		let randomStart = getRandomInt(TOKENS.length - (INPUTSIZE + 1)); // +1 for right-shift target
+		let modelInput = TOKENS.slice(randomStart, randomStart + INPUTSIZE);
+		let targetOutput = TOKENS.slice(randomStart + 1, randomStart + INPUTSIZE + 1);
+		
+		for (let i = 0; i < INPUTSIZE; i++){
+			modelInput[i] = DICTIONARY.indexOf(modelInput[i]);
+			targetOutput[i] = DICTIONARY.indexOf(targetOutput[i]);
+			let targetOutputArray = new Array(VOCABULARY_SIZE).fill(0);
+			targetOutputArray[targetOutput[i]] = 1;
+			targetOutput[i] = targetOutputArray;
+		}
+		modelInputBatch.push(modelInput);
+		targetOutputBatch.push(targetOutput);
+	}
+	let modelInputBatchTensor = tf.tidy(() => {
+		let result = tf.tensor([modelInputBatch]).squeeze();
+		if (BATCH_SIZE == 1){result = tf.expandDims(result, 0)}
+		return result
+	});
+	let targetOutputBatchTensor = tf.tidy(() => {
+		let result = tf.tensor([targetOutputBatch]).squeeze();
+		if (BATCH_SIZE == 1){result = tf.expandDims(result, 0)}
+		return result
+	});
+
+	if(epoch % PREDICTION_EPOCHS == 0){ //show input and prediction 
+
+		let prediction = [];
+		let predictionInputTensor = tf.tidy(() => {return tf.tensor([modelInputBatch[0]]).squeeze().expandDims(axis = 0)});
+		let predictionInput = modelInputBatch[0];
+		prediction = tf.tidy(() => {
+			return  model.predict(
+				[predictionInputTensor]
+			).dataSync()
+		});
+		tf.dispose(predictionInputTensor);
+		let predictionFormatted = [];
+
+
+		for (i = 0; i < INPUTSIZE; i++){
+			predictionFormatted.push([prediction.slice(i * VOCABULARY_SIZE, i * VOCABULARY_SIZE + VOCABULARY_SIZE)]);
+		}
+		
+		prediction = [];
+		for (i = 0; i < INPUTSIZE; i++){
+			predictionFormatted[i][0] = predictionFormatted[i][0].map(function(item){return item/TEMPERATURE});
+			predictionFormatted[i][0] = softmax(predictionFormatted[i][0]);
+//			predictionFormatted[i][0][1] = 0;
+			prediction.push(DICTIONARY[predictionFormatted[i][0].indexOf(Math.max(...predictionFormatted[i][0]))]);
+			predictionInput[i] = DICTIONARY[predictionInput[i]];
+		}
+
+		predictionInput = Object.values(predictionInput) //convert from object to flat array
+		for(let i = 0; i < predictionInput.length; i++){
+			predictionInput[i] = gpt3_decode([predictionInput[i]])
+		}
+		predictionInput = Object.values(predictionInput) //convert from object to flat array
+		predictionInput = predictionInput.join('|'); //convert to string
+		await log('input:' + predictionInput);
+
+		prediction = Object.values(prediction) //convert from object to flat array
+		for(let i = 0; i < prediction.length; i++){
+			prediction[i] = gpt3_decode([prediction[i]])
+		}
+		prediction = Object.values(prediction) //convert from object to flat array
+		prediction = prediction.join('|'); //convert to string
+		await log('prediction:' + prediction);
+		await log('saving model to indexedDB...');
+		await model.save('indexeddb://' + MODEL_SAVE_NAME);
+		
+////////////////////BEAM SEARCH
+		let stack = [];
+		let endPosition = INPUTSIZE - 1;
+		//let topKInputTensor = tf.tidy(() => {return tf.tensor([modelInputBatch[0]]).squeeze().expandDims(axis = 0)});
+		stack.push(modelInputBatch[0].concat(0)); // current_beam_length at last position
+		while (stack.length > 0){
+			let oldStack = stack[0]
+			oldStack = oldStack.slice(1, oldStack.length -1); //get old stack shifted right
+			let currentBeamLength = stack[0].pop();
+			if (currentBeamLength == BEAMLENGTH){
+				let debugArray = [...oldStack];
+				for(let j = 0; j < debugArray.length; j++){
+					debugArray[j] = DICTIONARY[debugArray[j]];
+					debugArray[j] = gpt3_decode([debugArray[j]])
+				}
+				debugArray = Object.values(debugArray) //convert from object to flat array
+				debugArray = debugArray.slice(debugArray.length - BEAMLENGTH);
+				
+				debugArray = debugArray.join('|'); //convert to string
+				console.log('pred: ' + debugArray);
+				log('pred: ' + debugArray);
+			}
+			
+			
+			console.log(currentBeamLength)
+			let results = tf.tidy(() => {
+				return  model.predict(
+					tf.tensor([stack.shift()]).squeeze().expandDims(axis = 0)
+				).dataSync()
+			});
+			
+			let Ks = results.slice(endPosition * VOCABULARY_SIZE, endPosition * VOCABULARY_SIZE + VOCABULARY_SIZE);
+			Ks = Array.from(Ks) //convert to 'normal' array from float32
+			Ks = Ks.map(function(item){return item/TEMPERATURE});
+			Ks = softmax(Ks);
+
+			//console.log(Ks);
+			let topKs = [];
+			let combinedProbability = 0;
+			let probabilities = [];
+			while ((combinedProbability < MAXPROBABILITY) && (topKs.length < MAXTOPKS)){
+			//while ((combinedProbability < MAXPROBABILITY) && (topKs.length < 1)){ //debug: only best non repeating token
+				let currentTopK = Ks.indexOf(Math.max(...Ks));
+				let currentProbability = Ks[currentTopK];
+				
+				//if (!oldStack.includes(currentTopK)){ //repetition penalty
+				//	topKs.push(currentTopK);
+				//	combinedProbability += currentProbability;
+				//}
+				topKs.push(currentTopK);
+				combinedProbability += currentProbability;
+				probabilities.push(currentProbability);
+				Ks.splice(currentTopK, 1);
+			}
+			if (currentBeamLength < BEAMLENGTH){
+				/*for (i = 0; i < topKs.length; i++){
+					let pushArray = oldStack.concat(topKs[i]);
+					pushArray = pushArray.concat(currentBeamLength + 1);
+					//console.log(pushArray)
+					stack.push(pushArray);
+					//console.log(oldStack.concat(topKs[i]));
+				}*/
+				let pushArray = oldStack.concat(topKs[getRandomInt(topKs.length -1)]);
+				pushArray = pushArray.concat(currentBeamLength + 1);
+					//console.log(pushArray)
+				stack.push(pushArray);
+				
+			}
+			console.log(stack);
+			console.log('topKs ' + topKs);
+			console.log('combinedProbability ' + combinedProbability);
+		}
+		//tf.dispose(topKInputTensor);
+			
+		// get top-k values for current k
+		// predict with every possible token
+		// save all results to data stack end
+		
+	} else {
+		let history = await model.fit(modelInputBatchTensor, targetOutputBatchTensor, {batchSize: BATCH_SIZE, epochs: STEPS});
+		let loss = history.history.loss[0].toFixed(3);
+		let perplexity = history.history.perplexity[0].toFixed(0);
+		tf.dispose(history);
+		let end = performance.now();
+		await log(
+			'epoch: ' + epoch +
+			' | loss: ' + loss + 
+			' | perplexity: ' + perplexity + 
+			'&#09;| ' + (end - start).toFixed(2) + 'ms ' +
+			''
+		);
+	}
+	tf.dispose(modelInputBatchTensor);
+	tf.dispose(targetOutputBatchTensor);		
+
+	
+
+}
+</script>
+
+<script>
+/******************************************************************************
+ * main loop
+ * here the action takes place
+ */
+
+async function mainLoop(){
+	await log('starting... ');
+	await loadAttentionModel(); 
+	await loadModel(); 
+	for (let epoch = 1; epoch < EPOCHS; epoch++){
+		await train(epoch)
+	}
+	await log('done.');
+}
+</script>
+
+<!-- **************************************************************************
+ * document html
+-->
+</head>
+<body>
+<p><h1>Text generation using (decoder-only) transformer with causal and linear attention in TFJS.</h1><br/>
+<a href="javascript:(async () => {document.getElementById('download').disabled = true;alert('accept multiple downloads');await model.save('downloads://' + MODEL_SAVE_NAME);document.getElementById('download').disabled = false})();"><button id="download">download current model</button></a>
+log:
+<div style="border:0px; margin:0px 0; padding:3px;">
+	<textarea id="log" rows="20" style="width:100%"></textarea>
+<div></p>
+</body>
+
+<!-- **************************************************************************
+ * starting function after document is loaded
+-->
+<script>
+window.onload = function(){
+	setTimeout(async function(){
+		try{
+			console.log(tf.version);
+			tf.enableProdMode();
+			
+			try{ 
+				await tf.ENV.set('WEBGL_PACK', false) //fix for crash since tfjs@3.4
+			}catch(err){}
+			try{ 
+				await tf.setBackend('webgpu')
+			}catch(err){}
+			try{
+				await tf.ready();
+			}catch{err}
+			await initialize();
+			await mainLoop();
+		}catch(err){
+			document.getElementById('log').innerHTML += err + '\r\n';
+			console.log(err);
+		}	
+	}, 1000);
+}
+</script>
