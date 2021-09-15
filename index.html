@@ -74,22 +74,24 @@ function getRandomInt(max){ //get random integer including 0
  * initialize vars 
  */
 async function initialize(){
-	dModel = 64; //dimension of embedding
+	dModel = 64; //dimension of embedding for linear attention
 	FEEDFORWARD_DIMENSION = 1024; //dimension of feed forward blocks
 	EPOCHS = 10000; //how many epochs to train
-	INPUTSIZE = 2048; //length of input
+	INPUTSIZE = 512; //length of input
 	STEPS = 1; //steps per epoch
 	BLOCKS = 12;
 	BATCH_SIZE = 1; 
 	PREDICTION_EPOCHS = 100; // how often to sample from model during training
 	LEARNING_RATE = 0.0001;
 	OPTIMIZER = tf.train.adamax(LEARNING_RATE, beta_1 = 0.6, beta_2 = 0.9, epsilon = 1e-7, decay = 0.01);
-	DATE = new Date().toISOString().split('T')[0];
-	MODEL_SAVE_NAME = 'linformer_tfjs_' + DATE + '_' + dModel;
+	DATE = new Date();
+	DATE = DATE.toISOString().slice(0, 10)
+	MODEL_SAVE_NAME = 'linformer_debug001_' + DATE;
 
 	LOSS = 'categoricalCrossentropy';
 
 	INITIALIZER = 'GlorotUniform';
+	PREDICTION_LENGTH = 15;
 	MAXTOPKS = 7; //max different token for predicting the beam
 	TEMPERATURE = 0.7; //temperature of softmax
 	MAXPROBABILITY = 0.9; //nucleus / top P as defined in https://arxiv.org/abs/1904.09751
@@ -443,72 +445,27 @@ async function train(epoch){
 
 	if(epoch % PREDICTION_EPOCHS == 0){ //show input and prediction 
 
-		let prediction = [];
-		let predictionInputTensor = tf.tidy(() => {return tf.tensor([modelInputBatch[0]]).squeeze().expandDims(axis = 0)});
-		let predictionInput = modelInputBatch[0];
-		prediction = tf.tidy(() => {
-			return  model.predict(
-				[predictionInputTensor]
-			).dataSync()
-		});
-		tf.dispose(predictionInputTensor);
-		let predictionFormatted = [];
-
-
-		for (i = 0; i < INPUTSIZE; i++){
-			predictionFormatted.push([prediction.slice(i * VOCABULARY_SIZE, i * VOCABULARY_SIZE + VOCABULARY_SIZE)]);
-		}
-		
-		prediction = [];
-		for (i = 0; i < INPUTSIZE; i++){
-			predictionFormatted[i][0] = predictionFormatted[i][0].map(function(item){return item/TEMPERATURE});
-			predictionFormatted[i][0] = softmax(predictionFormatted[i][0]);
-			prediction.push(DICTIONARY[predictionFormatted[i][0].indexOf(Math.max(...predictionFormatted[i][0]))]);
-			predictionInput[i] = DICTIONARY[predictionInput[i]];
-		}
-
-		predictionInput = Object.values(predictionInput) //convert from object to flat array
-		for(let i = 0; i < predictionInput.length; i++){
-			predictionInput[i] = gpt3_decode([predictionInput[i]])
-		}
-		predictionInput = Object.values(predictionInput) //convert from object to flat array
-		predictionInput = predictionInput.join('|'); //convert to string
-		await log('input:' + predictionInput);
-
-		prediction = Object.values(prediction) //convert from object to flat array
-		for(let i = 0; i < prediction.length; i++){
-			prediction[i] = gpt3_decode([prediction[i]])
-		}
-		prediction = Object.values(prediction) //convert from object to flat array
-		prediction = prediction.join('|'); //convert to string
-		await log('prediction:' + prediction);
 		await log('saving model to indexedDB...');
 		await model.save('indexeddb://' + MODEL_SAVE_NAME);
 		
-				let stack = [];
+		let stack = [];
 		let endPosition = INPUTSIZE - 1;
-		//let topKInputTensor = tf.tidy(() => {return tf.tensor([modelInputBatch[0]]).squeeze().expandDims(axis = 0)});
 		stack.push(modelInputBatch[0].concat(0)); // current_beam_length at last position
+		let generatedArray = [];
 		while (stack.length > 0){
 			let oldStack = stack[0]
 			oldStack = oldStack.slice(1, oldStack.length -1); //get old stack shifted right
-			let currentBeamLength = stack[0].pop();
-			if (currentBeamLength == BEAMLENGTH){
-				let debugArray = [...oldStack];
-				for(let j = 0; j < debugArray.length; j++){
-					debugArray[j] = DICTIONARY[debugArray[j]];
-					debugArray[j] = gpt3_decode([debugArray[j]])
-				}
-				debugArray = Object.values(debugArray) //convert from object to flat array
-				debugArray = debugArray.slice(debugArray.length - BEAMLENGTH);
-				
-				debugArray = debugArray.join('|'); //convert to string
-				console.log('pred: ' + debugArray);
-				log('pred: ' + debugArray);
+			let currentPredictionLength = stack[0].pop();
+			let predictionArray = [...oldStack];
+			for(let j = 0; j < predictionArray.length; j++){
+				predictionArray[j] = DICTIONARY[predictionArray[j]];
+				predictionArray[j] = gpt3_decode([predictionArray[j]])
 			}
+			predictionArray = Object.values(predictionArray) //convert from object to flat array
+			predictionArray = predictionArray.slice(predictionArray.length - 1);
 			
-			
-			console.log(currentBeamLength)
+			predictionArray = predictionArray.join('|'); //convert to string
+			generatedArray.push(predictionArray);
 			let results = tf.tidy(() => {
 				return  model.predict(
 					tf.tensor([stack.shift()]).squeeze().expandDims(axis = 0)
@@ -520,49 +477,25 @@ async function train(epoch){
 			Ks = Ks.map(function(item){return item/TEMPERATURE});
 			Ks = softmax(Ks);
 
-			//console.log(Ks);
 			let topKs = [];
 			let combinedProbability = 0;
 			let probabilities = [];
 			while ((combinedProbability < MAXPROBABILITY) && (topKs.length < MAXTOPKS)){
-			//while ((combinedProbability < MAXPROBABILITY) && (topKs.length < 1)){ //debug: only best non repeating token
 				let currentTopK = Ks.indexOf(Math.max(...Ks));
 				let currentProbability = Ks[currentTopK];
 				
-				//if (!oldStack.includes(currentTopK)){ //repetition penalty
-				//	topKs.push(currentTopK);
-				//	combinedProbability += currentProbability;
-				//}
 				topKs.push(currentTopK);
 				combinedProbability += currentProbability;
 				probabilities.push(currentProbability);
 				Ks.splice(currentTopK, 1);
 			}
-			if (currentBeamLength < BEAMLENGTH){
-				/*for (i = 0; i < topKs.length; i++){
-					let pushArray = oldStack.concat(topKs[i]);
-					pushArray = pushArray.concat(currentBeamLength + 1);
-					//console.log(pushArray)
-					stack.push(pushArray);
-					//console.log(oldStack.concat(topKs[i]));
-				}*/
+			if (currentPredictionLength < PREDICTION_LENGTH){
 				let pushArray = oldStack.concat(topKs[getRandomInt(topKs.length -1)]);
-				pushArray = pushArray.concat(currentBeamLength + 1);
-					//console.log(pushArray)
+				pushArray = pushArray.concat(currentPredictionLength + 1);
 				stack.push(pushArray);
-				
 			}
-			console.log(stack);
-			console.log('topKs ' + topKs);
-			console.log('combinedProbability ' + combinedProbability);
 		}
-		//tf.dispose(topKInputTensor);
-			
-		// get top-k values for current k
-		// predict with every possible token
-		// save all results to data stack end
-
-
+		await log('prediction: ' + generatedArray);
 	} else {
 		let history = await model.fit(modelInputBatchTensor, targetOutputBatchTensor, {batchSize: BATCH_SIZE, epochs: STEPS});
 		let loss = history.history.loss[0].toFixed(6);
@@ -607,7 +540,7 @@ async function mainLoop(){
 -->
 </head>
 <body>
-<p><h1>text generation using <a href='https://arxiv.org/abs/2006.04768'>linformer</a> with causal training and linear attention in TFJS.</h1><br/>
+<p><h1>text generation using <a href='https://arxiv.org/abs/2006.04768'>linformer</a> with causal training and linear attention in <a href='https://github.com/tensorflow/tfjs'>tensorflow.js</a></h1><br/>
 <a href="javascript:(async () => {document.getElementById('download').disabled = true;alert('accept multiple downloads');await model.save('downloads://' + MODEL_SAVE_NAME);document.getElementById('download').disabled = false})();"><button id="download">download current model</button></a>
 log:
 <div style="border:0px; margin:0px 0; padding:3px;">
