@@ -76,22 +76,22 @@ function getRandomInt(max){ //get random integer including 0
 async function initialize(){
 	dModel = 64; //dimension of embedding
 	FEEDFORWARD_DIMENSION = 1024; //dimension of feed forward blocks
-	EPOCHS = 1e9; //how many epochs to train
-	INPUTSIZE = 512; //length of input
+	EPOCHS = 10000; //how many epochs to train
+	INPUTSIZE = 2048; //length of input
 	STEPS = 1; //steps per epoch
 	BLOCKS = 12;
-	BATCH_SIZE = 3; 
-	PREDICTION_EPOCHS = 100;
+	BATCH_SIZE = 1; 
+	PREDICTION_EPOCHS = 100; // how often to sample from model during training
 	LEARNING_RATE = 0.0001;
 	OPTIMIZER = tf.train.adamax(LEARNING_RATE, beta_1 = 0.6, beta_2 = 0.9, epsilon = 1e-7, decay = 0.01);
-	MODEL_SAVE_NAME = 'gpt2_linear_01' + dModel;
+	DATE = new Date().toISOString().split('T')[0];
+	MODEL_SAVE_NAME = 'linformer_tfjs_' + DATE + '_' + dModel;
 
 	LOSS = 'categoricalCrossentropy';
 
 	INITIALIZER = 'GlorotUniform';
-	BEAMLENGTH = 16; //how log the Beam Search schould be
-	MAXTOPKS = 4; //max different token for predicting the beam
-	TEMPERATURE = 0.5; //temperature of softmax
+	MAXTOPKS = 7; //max different token for predicting the beam
+	TEMPERATURE = 0.7; //temperature of softmax
 	MAXPROBABILITY = 0.9; //nucleus / top P as defined in https://arxiv.org/abs/1904.09751
 	TOKENS = [];
 	//remove translators preface from DATASET
@@ -225,7 +225,7 @@ tf.serialization.registerClass(lambdaLayer);
 
 <script>
 /******************************************************************************
- * create new attention mode based on linformer
+ * create new attention mode based on linformer https://arxiv.org/abs/2006.04768
  */
 async function loadAttentionModel(){
 	await log('building new attention model...');
@@ -271,7 +271,7 @@ async function loadAttentionModel(){
  */
 async function loadModel(){
 	try {
-				model = await tf.loadLayersModel('indexeddb://' + MODEL_SAVE_NAME);
+		model = await tf.loadLayersModel('indexeddb://' + MODEL_SAVE_NAME);
 		model.compile({optimizer: OPTIMIZER, loss: LOSS, metrics: perplexity});
 		await log('successfully loaded saved model...');
 	}catch(err){
@@ -307,7 +307,7 @@ async function loadModel(){
 			//feed forward network
 			x = tf.layers.layerNormalization({name: 'normalization_' + i + '_2'}).apply(x);
 			x = tf.layers.dense({units: FEEDFORWARD_DIMENSION}).apply(x);
-			x = new lambdaLayer({name: 'gelu_' + i, lambdaFunction: `
+			x = new lambdaLayer({name: 'gelu_' + i, lambdaFunction: ` //gelu activation function
 				result = tf.mul(
 					tf.scalar(0.5),
 					tf.mul(
@@ -350,7 +350,7 @@ async function loadModel(){
 		let outputs = x
 		outputs = tf.layers.layerNormalization({name: 'normalization_outputs'}).apply(outputs);
 		outputs = tf.layers.dense({name: 'dense_outputs1', units: FEEDFORWARD_DIMENSION}).apply(outputs);
-		outputs = new lambdaLayer({name: 'gelu_outputs', lambdaFunction: `
+		outputs = new lambdaLayer({name: 'gelu_outputs', lambdaFunction: ` //gelu activation function
 			result = tf.mul(
 				tf.scalar(0.5),
 				tf.mul(
@@ -484,6 +484,84 @@ async function train(epoch){
 		await log('prediction:' + prediction);
 		await log('saving model to indexedDB...');
 		await model.save('indexeddb://' + MODEL_SAVE_NAME);
+		
+				let stack = [];
+		let endPosition = INPUTSIZE - 1;
+		//let topKInputTensor = tf.tidy(() => {return tf.tensor([modelInputBatch[0]]).squeeze().expandDims(axis = 0)});
+		stack.push(modelInputBatch[0].concat(0)); // current_beam_length at last position
+		while (stack.length > 0){
+			let oldStack = stack[0]
+			oldStack = oldStack.slice(1, oldStack.length -1); //get old stack shifted right
+			let currentBeamLength = stack[0].pop();
+			if (currentBeamLength == BEAMLENGTH){
+				let debugArray = [...oldStack];
+				for(let j = 0; j < debugArray.length; j++){
+					debugArray[j] = DICTIONARY[debugArray[j]];
+					debugArray[j] = gpt3_decode([debugArray[j]])
+				}
+				debugArray = Object.values(debugArray) //convert from object to flat array
+				debugArray = debugArray.slice(debugArray.length - BEAMLENGTH);
+				
+				debugArray = debugArray.join('|'); //convert to string
+				console.log('pred: ' + debugArray);
+				log('pred: ' + debugArray);
+			}
+			
+			
+			console.log(currentBeamLength)
+			let results = tf.tidy(() => {
+				return  model.predict(
+					tf.tensor([stack.shift()]).squeeze().expandDims(axis = 0)
+				).dataSync()
+			});
+			
+			let Ks = results.slice(endPosition * VOCABULARY_SIZE, endPosition * VOCABULARY_SIZE + VOCABULARY_SIZE);
+			Ks = Array.from(Ks) //convert to 'normal' array from float32
+			Ks = Ks.map(function(item){return item/TEMPERATURE});
+			Ks = softmax(Ks);
+
+			//console.log(Ks);
+			let topKs = [];
+			let combinedProbability = 0;
+			let probabilities = [];
+			while ((combinedProbability < MAXPROBABILITY) && (topKs.length < MAXTOPKS)){
+			//while ((combinedProbability < MAXPROBABILITY) && (topKs.length < 1)){ //debug: only best non repeating token
+				let currentTopK = Ks.indexOf(Math.max(...Ks));
+				let currentProbability = Ks[currentTopK];
+				
+				//if (!oldStack.includes(currentTopK)){ //repetition penalty
+				//	topKs.push(currentTopK);
+				//	combinedProbability += currentProbability;
+				//}
+				topKs.push(currentTopK);
+				combinedProbability += currentProbability;
+				probabilities.push(currentProbability);
+				Ks.splice(currentTopK, 1);
+			}
+			if (currentBeamLength < BEAMLENGTH){
+				/*for (i = 0; i < topKs.length; i++){
+					let pushArray = oldStack.concat(topKs[i]);
+					pushArray = pushArray.concat(currentBeamLength + 1);
+					//console.log(pushArray)
+					stack.push(pushArray);
+					//console.log(oldStack.concat(topKs[i]));
+				}*/
+				let pushArray = oldStack.concat(topKs[getRandomInt(topKs.length -1)]);
+				pushArray = pushArray.concat(currentBeamLength + 1);
+					//console.log(pushArray)
+				stack.push(pushArray);
+				
+			}
+			console.log(stack);
+			console.log('topKs ' + topKs);
+			console.log('combinedProbability ' + combinedProbability);
+		}
+		//tf.dispose(topKInputTensor);
+			
+		// get top-k values for current k
+		// predict with every possible token
+		// save all results to data stack end
+
 
 	} else {
 		let history = await model.fit(modelInputBatchTensor, targetOutputBatchTensor, {batchSize: BATCH_SIZE, epochs: STEPS});
